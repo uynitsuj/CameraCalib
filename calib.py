@@ -1,71 +1,203 @@
-#!/usr/bin/env python
- 
 import cv2
 import numpy as np
-import glob
- 
-# Defining the dimensions of checkerboard
-CHECKERBOARD = (6,9)
+import time
+
+# Checkerboard parameters
+CHECKERBOARD = (6, 8)
 criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
- 
-# Creating vector to store vectors of 3D points for each checkerboard image
-objpoints = []
-# Creating vector to store vectors of 2D points for each checkerboard image
-imgpoints = [] 
- 
- 
-# Defining the world coordinates for 3D points
-objp = np.zeros((1, CHECKERBOARD[0] * CHECKERBOARD[1], 3), np.float32)
-objp[0,:,:2] = np.mgrid[0:CHECKERBOARD[0], 0:CHECKERBOARD[1]].T.reshape(-1, 2)
-prev_img_shape = None
- 
-# Extracting path of individual image stored in a given directory
-images = glob.glob('./calibration_images/*.jpg')
-# print(images)
-for fname in images:
-    img = cv2.imread(fname)
-    gray = cv2.cvtColor(img,cv2.COLOR_BGR2GRAY)
-    # Find the chess board corners
-    # If desired number of corners are found in the image then ret = true
-    ret, corners = cv2.findChessboardCorners(gray, CHECKERBOARD, cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_FAST_CHECK + cv2.CALIB_CB_NORMALIZE_IMAGE)
-     
-    """
-    If desired number of corner are detected,
-    we refine the pixel coordinates and display 
-    them on the images of checker board
-    """
-    if ret == True:
-        objpoints.append(objp)
-        # refining pixel coordinates for given 2d points.
-        corners2 = cv2.cornerSubPix(gray, corners, (11,11),(-1,-1), criteria)
-         
-        imgpoints.append(corners2)
- 
-        # Draw and display the corners
-        img = cv2.drawChessboardCorners(img, CHECKERBOARD, corners2, ret)
-     
-    cv2.imshow('img',img)
-    cv2.waitKey(0)
- 
-cv2.destroyAllWindows()
- 
-h,w = img.shape[:2]
- 
-"""
-Performing camera calibration by 
-passing the value of known 3D points (objpoints)
-and corresponding pixel coordinates of the 
-detected corners (imgpoints)
-"""
-ret, mtx, dist, rvecs, tvecs = cv2.calibrateCamera(objpoints, imgpoints, gray.shape[::-1], None, None)
- 
-print("Camera matrix : \n")
-print(mtx)
-print("dist : \n")
-print(dist)
-print("rvecs : \n")
-print(rvecs)
-print("tvecs : \n")
-print(tvecs)
 
+class CameraCalibrator:
+    def __init__(self, device_id=0, width=848, height=480, fps=2):
+        # Initialize camera
+        self.cap = cv2.VideoCapture(device_id)
+        if not self.cap.isOpened():
+            raise RuntimeError("Cannot open camera")
+            
+        # Set camera properties
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        
+        # Calibration data storage
+        self.objpoints = []
+        self.imgpoints = []
+        
+        # Create 3D points
+        self.objp = np.zeros((1, CHECKERBOARD[0] * CHECKERBOARD[1], 3), np.float32)
+        self.objp[0,:,:2] = np.mgrid[0:CHECKERBOARD[0], 0:CHECKERBOARD[1]].T.reshape(-1, 2)
+        
+        # Frame rate control
+        self.frame_interval = 1.0 / fps
+        self.last_frame_time = 0
+        
+        # Statistics
+        self.total_frames = 0
+        self.valid_frames = 0
+        
+        # Calibration results
+        self.camera_matrix = None
+        self.dist_coeffs = None
+        self.rvecs = None
+        self.tvecs = None
 
+    def is_valid_pattern(self, frame):
+        """Check if frame contains a valid checkerboard pattern"""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        ret, corners = cv2.findChessboardCorners(
+            gray, 
+            CHECKERBOARD, 
+            cv2.CALIB_CB_ADAPTIVE_THRESH + 
+            cv2.CALIB_CB_FAST_CHECK + 
+            cv2.CALIB_CB_NORMALIZE_IMAGE
+        )
+        
+        if ret:
+            # Refine corners
+            corners2 = cv2.cornerSubPix(gray, corners, (11,11), (-1,-1), criteria)
+            return True, gray, corners2
+        return False, None, None
+
+    def process_frame(self, frame):
+        """Process a frame and return display frame with annotations"""
+        self.total_frames += 1
+        display_frame = frame.copy()
+        
+        valid, gray, corners = self.is_valid_pattern(frame)
+        
+        if valid:
+            self.valid_frames += 1
+            
+            # Store calibration points
+            self.objpoints.append(self.objp)
+            self.imgpoints.append(corners)
+            
+            # Draw corners on display frame
+            cv2.drawChessboardCorners(display_frame, CHECKERBOARD, corners, True)
+            status_color = (0, 255, 0)  # Green for valid pattern
+        else:
+            status_color = (0, 0, 255)  # Red for invalid pattern
+        
+        # Add status text
+        cv2.putText(
+            display_frame,
+            f"Valid Patterns: {len(self.imgpoints)}", 
+            (10, 30), 
+            cv2.FONT_HERSHEY_SIMPLEX, 
+            0.7,
+            (0, 255, 0),
+            2
+        )
+        
+        cv2.putText(
+            display_frame,
+            f"Current Frame: {'Valid' if valid else 'Invalid'}", 
+            (10, 60), 
+            cv2.FONT_HERSHEY_SIMPLEX, 
+            0.7,
+            status_color,
+            2
+        )
+        
+        cv2.putText(
+            display_frame,
+            f"Success Rate: {self.valid_frames/self.total_frames*100:.1f}%", 
+            (10, 90), 
+            cv2.FONT_HERSHEY_SIMPLEX, 
+            0.7,
+            (255, 255, 0),
+            2
+        )
+        
+        return display_frame, valid
+
+    def calibrate(self):
+        if len(self.objpoints) > 5:  # Need at least 5 patterns for good calibration
+            ret, mtx, dist, rvecs, tvecs = cv2.calibrateCamera(
+                self.objpoints,
+                self.imgpoints,
+                self.current_resolution[::-1],  # Swap width/height
+                None,
+                None
+            )
+            
+            if ret:
+                self.camera_matrix = mtx
+                self.dist_coeffs = dist
+                self.rvecs = rvecs
+                self.tvecs = tvecs
+                
+                # Calculate reprojection error
+                mean_error = 0
+                for i in range(len(self.objpoints)):
+                    imgpoints2, _ = cv2.projectPoints(
+                        self.objpoints[i],
+                        rvecs[i],
+                        tvecs[i],
+                        mtx,
+                        dist
+                    )
+                    error = cv2.norm(self.imgpoints[i], imgpoints2, cv2.NORM_L2)/len(imgpoints2)
+                    mean_error += error
+                
+                print("\nCalibration Results:")
+                print("Camera matrix:")
+                print(self.camera_matrix)
+                print("\nDistortion coefficients:")
+                print(self.dist_coeffs)
+                print(f"\nTotal reprojection error: {mean_error/len(self.objpoints)}")
+                print(f"\nUsed {len(self.objpoints)} valid frames out of {self.total_frames} total frames")
+                print(f"Frame validation rate: {self.valid_frames/self.total_frames*100:.1f}%")
+                
+                return True
+        return False
+
+    def run(self):
+        print("Press 'c' to perform calibration")
+        print("Press 'r' to reset collected patterns")
+        print("Press 'q' to quit")
+        
+        while True:
+            current_time = time.time()
+            
+            # Control frame rate
+            if (current_time - self.last_frame_time) < self.frame_interval:
+                continue
+                
+            self.last_frame_time = current_time
+            
+            ret, frame = self.cap.read()
+            if not ret:
+                print("Failed to grab frame")
+                break
+                
+            self.current_resolution = frame.shape[:2]  # Store for calibration
+            
+            # Process frame
+            display_frame, is_valid = self.process_frame(frame)
+            
+            # Show frame
+            cv2.imshow('Camera Calibration', display_frame)
+            
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('c'):
+                if self.calibrate():
+                    print("Calibration successful!")
+                else:
+                    print("Need at least 5 different patterns for calibration")
+            elif key == ord('r'):
+                self.objpoints = []
+                self.imgpoints = []
+                self.total_frames = 0
+                self.valid_frames = 0
+                print("Reset calibration points")
+        
+        self.cap.release()
+        cv2.destroyAllWindows()
+
+if __name__ == '__main__':
+    try:
+        calibrator = CameraCalibrator(device_id=0, fps=2)  # 2 FPS for stable processing
+        calibrator.run()
+    except Exception as e:
+        print(f"Error: {str(e)}")
